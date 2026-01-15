@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, BigInteger, Boolean, DateTime
+from sqlalchemy import Column, String, Integer, BigInteger, Boolean, DateTime, Float
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from app.database import Base
@@ -15,9 +15,9 @@ class Subscriber(Base):
     node_id = Column(String(50), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    sessions = relationship("Session", back_populates="subscriber")
+    sessions = relationship("DbSession", back_populates="subscriber")
 
-class Session(Base):
+class DbSession(Base):
     __tablename__ = "sessions"
     session_id = Column(String(50), primary_key=True)
     subscriber_id = Column(String(50))
@@ -53,7 +53,7 @@ class NodeMetrics(Base):
     metric_id = Column(BigInteger, primary_key=True, autoincrement=True)
     node_id = Column(String(50), nullable=False)
     metric_type = Column(String(50))
-    metric_value = Column(Integer)  # or Float / JSONB depending on use
+    metric_value = Column(Float)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
 class DistributedTransaction(Base):
@@ -75,6 +75,37 @@ class LoadDecision(Base):
     source_node = Column(String(50))
     target_node = Column(String(50))
     reason = Column(String(100))
-    cpu_before = Column(Integer)
-    cpu_after = Column(Integer)
+    cpu_before = Column(Float)
+    cpu_after = Column(Float)
     decision_time = Column(DateTime, default=datetime.utcnow)
+
+class FaultLog(Base):
+    __tablename__ = "fault_logs"
+    fault_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    node_id = Column(String(50))
+    fault_type = Column(String(50))
+    injected_at = Column(DateTime, default=datetime.utcnow)
+    detected_at = Column(DateTime)
+    recovered_at = Column(DateTime)
+    recovery_time_ms = Column(Integer)
+    affected_sessions = Column(Integer, default=0)
+
+class ConsensusState(Base):
+    __tablename__ = "consensus_state"
+    node_id = Column(String(50), primary_key=True)
+    current_term = Column(Integer, default=0)
+    voted_for = Column(String(50))
+    leader_id = Column(String(50))
+    last_heartbeat = Column(DateTime, default=datetime.utcnow)
+    status = Column(String(20), default="FOLLOWER")
+
+class SystemMetrics(Base):
+    __tablename__ = "system_metrics"
+    metric_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    edge_cpu_avg = Column(Float)
+    core_cpu_avg = Column(Float)
+    cloud_cpu_avg = Column(Float)
+    overall_latency_avg = Column(Float)
+    transaction_rate = Column(Integer)
+    packet_loss_rate = Column(Float, default=0.0)
+    timestamp = Column(DateTime, default=datetime.utcnow)

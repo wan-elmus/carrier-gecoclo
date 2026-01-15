@@ -1,3 +1,4 @@
+from app.services.load import LoadBalancer
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -11,10 +12,13 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from app.routers import edge, core, cloud, fault, load, metrics
 from app.config import settings
-from app.database import health_check
+from app.database import health_check, get_db, AsyncSessionLocal
 from utils.logger import setup_logger
 from utils.heartbeat import start_heartbeat
-import services.metrics as metrics_service
+from services.metrics import MetricsService
+from services.consensus import ConsensusService, start_consensus
+from services.fault import FaultService
+from services.replication import ReplicationService
 
 logger = setup_logger(__name__)
 
@@ -57,17 +61,21 @@ async def root():
     }
 
 @app.get("/health", tags=["health"])
-async def health():
+async def health(db: AsyncSession = Depends(get_db)):
     db_healthy = await health_check()
     if not db_healthy:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database connection failed"
         )
+
+    # Add consensus leader check for full health
+    leader_info = await ConsensusService.get_leader_info(db)
     return {
         "status": "healthy",
         "node_id": settings.NODE_ID,
         "database": "connected",
+        "current_leader": leader_info.get("leader_id") if leader_info else "No leader elected",
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -100,14 +108,32 @@ async def general_exception_handler(request, exc):
 @app.on_event("startup")
 async def startup_event():
     logger.info(f"Starting {settings.NODE_TYPE} node {settings.NODE_ID} on port {settings.NODE_PORT}")
+
+    async with AsyncSessionLocal() as db:
+        # Initial replication if cloud (ensures sync on start)
+        if settings.NODE_TYPE == "cloud":
+            await ReplicationService.perform_full_replication(db)
+
+        # Start consensus if core
+        if settings.NODE_TYPE == "core":
+            await start_consensus(db)
+
+    # Common backgrounds
     asyncio.create_task(start_heartbeat())
+    asyncio.create_task(FaultService.detect_failures())
+    asyncio.create_task(FaultService.auto_recover_failures())
+    asyncio.create_task(LoadBalancer.auto_balance_load(db))  # db per call
+
+    # Metrics if monitoring
     if settings.NODE_ID == "monitoring":
-        asyncio.create_task(metrics_service.collect_system_metrics())
+        asyncio.create_task(MetricsService.collect_system_metrics())
+
     logger.info("Node startup completed")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info(f"Shutting down {settings.NODE_ID}")
+    # Cancel tasks if needed (asyncio will handle on exit)
 
 if __name__ == "__main__":
     uvicorn.run(
@@ -115,5 +141,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=settings.NODE_PORT,
         reload=False,
-        log_level="info"
+        log_level="info",
+        workers=4  # For better concurrency in prod
     )
