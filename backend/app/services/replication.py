@@ -6,10 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, insert, text, update
 from app.models import Subscriber, DbSession, TransactionLog
 from app.config import settings
-from utils.logger import setup_logger
-from utils.network import NetworkClient
-from utils.clocks import get_clock_manager
-from utils.locks import DistributedLock
+from app.utils.logger import setup_logger
+from app.utils.network import NetworkClient
+from app.utils.clocks import get_clock_manager
+from app.utils.locks import DistributedLock
 from app.database import SCHEMAS, set_session_schema
 
 logger = setup_logger(__name__)

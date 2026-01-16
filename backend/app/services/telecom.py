@@ -8,11 +8,12 @@ from sqlalchemy import func, select, text, update
 from app.models import Subscriber, DbSession, TransactionLog
 from app.schemas import SubscriberCreate, SessionCreate
 from app.config import settings
-from utils.logger import setup_logger
-from utils.network import NetworkClient, get_network_latency
-from utils.clocks import get_clock_manager
-from utils.locks import DistributedLock
-from services.replication import ReplicationService
+from app.utils.logger import setup_logger
+from app.utils.network import NetworkClient, get_network_latency
+from app.utils.clocks import get_clock_manager
+from app.utils.locks import DistributedLock
+from app.services.replication import ReplicationService
+from app.database import AsyncSessionLocal
 
 logger = setup_logger(__name__)
 clock_manager = get_clock_manager()  # Assume initialized in startup
@@ -95,7 +96,7 @@ class TelecomService:
 
             clock_manager.create_event({"type": "session_setup", "id": session_id})
 
-            asyncio.create_task(TelecomService.monitor_session_qos(session_id, threshold, db))
+            asyncio.create_task(TelecomService.monitor_session_qos(session_id, threshold))
 
             asyncio.create_task(TelecomService.replicate_to_core(session, "CREATE"))
 
@@ -104,28 +105,36 @@ class TelecomService:
             await db.rollback()
             logger.error(f"Failed to setup session: {e}")
             raise
-
+        
     @staticmethod
-    async def monitor_session_qos(session_id: str, threshold_ms: int, db: AsyncSession):
-        """Monitor session QoS in background (started from edge /sessions/start background_task)"""
-        try:
-            while True:
-                result = await db.execute(
-                    select(DbSession).where(DbSession.session_id == session_id)
-                )
-                session = result.scalar_one_or_none()
-                if not session or session.status != "ACTIVE":
-                    break
+    async def monitor_session_qos(session_id: str, threshold_ms: int):
+        logger.info(f"QoS monitor started for {session_id}")
 
-                current_latency = await TelecomService.calculate_current_latency(session_id)
-                if current_latency > threshold_ms:
-                    logger.warning(f"QoS violation for {session_id}: {current_latency}ms > {threshold_ms}ms")
-                    await TelecomService._record_qos_violation(session_id, current_latency, threshold_ms, db)
+        while True:
+            try:
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(
+                            select(DbSession).where(DbSession.session_id == session_id)
+                        )
+                    session = result.scalar_one_or_none()
+                    if not session or session.status != "ACTIVE":
+                        break
+
+                    latency = await TelecomService.calculate_current_latency(session_id, db)
+
+                    if latency > threshold_ms:
+                        await TelecomService._record_qos_violation(
+                            session_id, latency, threshold_ms, db
+                        )
 
                 await asyncio.sleep(30)
-            logger.info(f"QoS monitoring stopped for {session_id}")
-        except Exception as e:
-            logger.error(f"QoS monitoring error for {session_id}: {e}")
+
+            except Exception as e:
+                logger.error(f"QoS monitoring error for {session_id}: {e}")
+                await asyncio.sleep(5)
+
+        logger.info(f"QoS monitoring stopped for {session_id}")
+
 
     @staticmethod
     def _get_latency_threshold(session_type: str, qos_profile: Dict) -> int:
@@ -230,17 +239,21 @@ class TelecomService:
             return False
 
     @staticmethod
-    async def calculate_current_latency(session_id: str, db: AsyncSession) -> float:
-        """Calculate current latency for a session (called from edge get_session_status or core overview)"""
+    async def calculate_current_latency(session_id: str) -> float:
         try:
-            result = await db.execute(
-                select(DbSession.current_node).where(DbSession.session_id == session_id)
-            )
-            current_node = result.scalar()
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(DbSession.current_node).where(DbSession.session_id == session_id)
+                )
+                current_node = result.scalar()
+
             if not current_node:
                 return 0.0
 
-            return await get_network_latency(settings.NODE_ID, current_node) or TelecomService._simulate_current_latency()
+            return await get_network_latency(
+                settings.NODE_ID, current_node
+            ) or TelecomService._simulate_current_latency()
+
         except Exception as e:
             logger.error(f"Failed to calculate latency: {e}")
             return 0.0

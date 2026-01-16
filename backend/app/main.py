@@ -1,3 +1,23 @@
+from app.database import Base
+Base.metadata.clear()
+
+# Initialize clock manager EARLY
+from app.utils.clocks import init_clock_manager
+from app.config import settings
+import json
+from pathlib import Path
+
+# Load all node IDs from ports_config.json
+ports_path = Path("ports_config.json")
+if ports_path.exists():
+    with ports_path.open() as f:
+        config = json.load(f)
+    all_nodes = list(config.get("nodes", {}).keys())
+else:
+    all_nodes = [settings.NODE_ID]  # fallback
+
+init_clock_manager(node_id=settings.NODE_ID, all_nodes=all_nodes)
+
 from app.services.load import LoadBalancer
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,18 +27,17 @@ import asyncio
 from datetime import datetime
 import os
 import sys
+from sqlalchemy.ext.asyncio import AsyncSession
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from app.routers import edge, core, cloud, fault, load, metrics
+from app.routers import edge, core, cloud, fault, metrics
 from app.config import settings
 from app.database import health_check, get_db, AsyncSessionLocal
-from utils.logger import setup_logger
-from utils.heartbeat import start_heartbeat
-from services.metrics import MetricsService
-from services.consensus import ConsensusService, start_consensus
-from services.fault import FaultService
-from services.replication import ReplicationService
+from app.utils.logger import setup_logger
+from app.utils.heartbeat import start_heartbeat
+from app.services.metrics import MetricsService
+from app.services.consensus import ConsensusService, start_consensus
+from app.services.fault import FaultService
+from app.services.replication import ReplicationService
 
 logger = setup_logger(__name__)
 
@@ -69,7 +88,6 @@ async def health(db: AsyncSession = Depends(get_db)):
             detail="Database connection failed"
         )
 
-    # Add consensus leader check for full health
     leader_info = await ConsensusService.get_leader_info(db)
     return {
         "status": "healthy",
@@ -87,7 +105,7 @@ elif settings.NODE_TYPE == "cloud":
     app.include_router(cloud.router, prefix="/cloud", tags=["cloud"], dependencies=[Depends(verify_api_key)])
 
 app.include_router(fault.router, prefix="/fault", tags=["fault"], dependencies=[Depends(verify_api_key)])
-app.include_router(load.router, prefix="/load", tags=["load"], dependencies=[Depends(verify_api_key)])
+
 app.include_router(metrics.router, prefix="/metrics", tags=["metrics"], dependencies=[Depends(verify_api_key)])
 
 @app.exception_handler(HTTPException)
@@ -110,21 +128,17 @@ async def startup_event():
     logger.info(f"Starting {settings.NODE_TYPE} node {settings.NODE_ID} on port {settings.NODE_PORT}")
 
     async with AsyncSessionLocal() as db:
-        # Initial replication if cloud (ensures sync on start)
         if settings.NODE_TYPE == "cloud":
             await ReplicationService.perform_full_replication(db)
 
-        # Start consensus if core
         if settings.NODE_TYPE == "core":
             await start_consensus(db)
 
-    # Common backgrounds
     asyncio.create_task(start_heartbeat())
     asyncio.create_task(FaultService.detect_failures())
     asyncio.create_task(FaultService.auto_recover_failures())
-    asyncio.create_task(LoadBalancer.auto_balance_load(db))  # db per call
+    asyncio.create_task(LoadBalancer.auto_balance_loop())
 
-    # Metrics if monitoring
     if settings.NODE_ID == "monitoring":
         asyncio.create_task(MetricsService.collect_system_metrics())
 
@@ -133,7 +147,6 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info(f"Shutting down {settings.NODE_ID}")
-    # Cancel tasks if needed (asyncio will handle on exit)
 
 if __name__ == "__main__":
     uvicorn.run(
@@ -142,5 +155,5 @@ if __name__ == "__main__":
         port=settings.NODE_PORT,
         reload=False,
         log_level="info",
-        workers=4  # For better concurrency in prod
+        workers=4
     )

@@ -6,7 +6,7 @@ from typing import Dict, Optional
 from sqlalchemy import text
 from app.config import settings
 from app.database import AsyncSessionLocal
-from utils.logger import setup_logger, TelecomLogger
+from app.utils.logger import setup_logger, TelecomLogger
 
 logger = setup_logger(__name__)
 telecom_logger = TelecomLogger()
@@ -22,56 +22,59 @@ class NodeHealth:
             self.metrics["memory_percent"] = psutil.virtual_memory().percent
             telecom_logger.log_metric(logger, "cpu_usage", self.metrics["cpu_percent"], {"node_id": self.node_id})
             telecom_logger.log_metric(logger, "memory_usage", self.metrics["memory_percent"], {"node_id": self.node_id})
-            return self.metrics
         except Exception as e:
             logger.error(f"Metrics collection failed: {e}")
-            return self.metrics
+        return self.metrics
 
 class HeartbeatManager:
     def __init__(self):
         self.node_health = NodeHealth(settings.NODE_ID)
-        self.failed_nodes: list = []
 
     async def send_heartbeat(self) -> None:
         try:
             async with AsyncSessionLocal() as session:
                 metrics = await self.node_health.collect_metrics()
-                await session.execute(
-                    text("""
-                        INSERT INTO shared_schema.consensus_state 
-                        (node_id, last_heartbeat, status, cpu_percent, memory_percent)
-                        VALUES (:node_id, NOW(), 'ACTIVE', :cpu, :memory)
-                        ON CONFLICT (node_id) 
-                        DO UPDATE SET 
-                            last_heartbeat = NOW(), 
-                            status = 'ACTIVE',
-                            cpu_percent = :cpu,
-                            memory_percent = :memory
-                    """),
-                    {"node_id": settings.NODE_ID, "cpu": metrics["cpu_percent"], "memory": metrics["memory_percent"]}
-                )
-                await self._check_failed_nodes(session)
-                await session.commit()
-                logger.debug(f"Heartbeat sent for {settings.NODE_ID}")
+                try:
+                    await session.execute(
+                        text("""
+                            INSERT INTO shared_schema.consensus_state 
+                            (node_id, last_heartbeat, status, cpu_percent, memory_percent)
+                            VALUES (:node_id, NOW(), 'ACTIVE', :cpu, :memory)
+                            ON CONFLICT (node_id) 
+                            DO UPDATE SET 
+                                last_heartbeat = NOW(), 
+                                status = 'ACTIVE',
+                                cpu_percent = :cpu,
+                                memory_percent = :memory
+                        """),
+                        {
+                            "node_id": settings.NODE_ID,
+                            "cpu": metrics["cpu_percent"],
+                            "memory": metrics["memory_percent"]
+                        }
+                    )
+                    await session.commit()
+                except Exception as e:
+                    logger.error(f"Heartbeat DB update failed (ignored): {e}")
+                    await session.rollback()
         except Exception as e:
             logger.error(f"Heartbeat failed: {e}")
 
     async def _check_failed_nodes(self, session) -> None:
-        timeout_sec = settings.HEARTBEAT_TIMEOUT_MS / 1000
-        result = await session.execute(
-            text("""
-                SELECT node_id, last_heartbeat 
-                FROM shared_schema.consensus_state 
-                WHERE last_heartbeat < NOW() - :timeout * INTERVAL '1 second'
-                AND status != 'FAILED'
-            """),
-            {"timeout": timeout_sec}
-        )
-        for row in result.fetchall():
-            node_id, last = row
-            if node_id not in self.failed_nodes:
+        try:
+            timeout_sec = settings.HEARTBEAT_TIMEOUT_MS / 1000
+            result = await session.execute(
+                text("""
+                    SELECT node_id, last_heartbeat 
+                    FROM shared_schema.consensus_state 
+                    WHERE last_heartbeat < NOW() - :timeout * INTERVAL '1 second'
+                    AND status != 'FAILED'
+                """),
+                {"timeout": timeout_sec}
+            )
+            for row in result.fetchall():
+                node_id, last = row
                 logger.warning(f"Node {node_id} failed (last: {last})")
-                self.failed_nodes.append(node_id)
                 await session.execute(
                     text("UPDATE shared_schema.consensus_state SET status = 'FAILED' WHERE node_id = :nid"),
                     {"nid": node_id}
@@ -84,6 +87,10 @@ class HeartbeatManager:
                     """),
                     {"nid": node_id}
                 )
+            await session.commit()
+        except Exception as e:
+            logger.error(f"Failed to check failed nodes: {e}")
+            await session.rollback()
 
     async def check_node_health(self, node_url: str) -> Optional[Dict]:
         try:

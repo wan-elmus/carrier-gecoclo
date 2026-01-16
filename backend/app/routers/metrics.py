@@ -10,11 +10,11 @@ from app.database import get_db
 from app.models import NodeMetrics, DbSession
 from app.schemas import NodeMetricsResponse, SystemMetricsResponse, MessageResponse
 from app.config import settings
-from utils.logger import setup_logger, TelecomLogger
-from utils.heartbeat import NodeHealth
-from utils.clocks import get_clock_manager
-from utils.locks import DistributedLock
-from utils.network import NetworkClient
+from app.utils.logger import setup_logger, TelecomLogger
+from app.utils.heartbeat import NodeHealth
+from app.utils.clocks import get_clock_manager
+from app.utils.locks import DistributedLock
+from app.utils.network import NetworkClient
 
 router = APIRouter()
 logger = setup_logger(__name__)

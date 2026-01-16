@@ -1,7 +1,10 @@
 from pathlib import Path
 import json
-from pydantic import BaseSettings, PostgresDsn, validator
 from dotenv import load_dotenv
+
+from pydantic import PostgresDsn, Field
+from pydantic_settings import BaseSettings
+from pydantic.functional_validators import field_validator
 
 load_dotenv()
 
@@ -40,22 +43,29 @@ class Settings(BaseSettings):
     API_KEY: str
     JWT_SECRET: str
 
-    NODE_URLS: dict = {}
+    NODE_URLS: dict = Field(default_factory=dict)
+    LOAD_BALANCE_INTERVAL_SECONDS: int = Field(30, ge=10, description="How often to run auto-balance (seconds)")
 
     @property
     def node_schema(self) -> str:
-        map_ = {"edge": "edge_schema", "core": "core_schema", "cloud": "cloud_schema"}
-        return map_.get(self.NODE_TYPE, "public")
+        return {
+            "edge": "edge_schema",
+            "core": "core_schema",
+            "cloud": "cloud_schema",
+        }.get(self.NODE_TYPE, "public")
 
-    @validator("NODE_TYPE")
-    def valid_type(cls, v):
-        if v not in ["edge", "core", "cloud"]:
-            raise ValueError("NODE_TYPE must be edge, core, or cloud")
+    @field_validator("NODE_TYPE")
+    @classmethod
+    def validate_node_type(cls, v: str) -> str:
+        allowed = {"edge", "core", "cloud", "monitoring", "gateway"}
+        if v not in allowed:
+            raise ValueError(f"NODE_TYPE must be one of: {', '.join(allowed)}")
         return v
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    model_config = {
+        "env_file": ".env",
+        "case_sensitive": True,
+    }
 
 settings = Settings()
 

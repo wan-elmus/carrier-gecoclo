@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import text
 from app.database import AsyncSession, AsyncSessionLocal
 from app.config import settings
-from utils.logger import setup_logger
+from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 

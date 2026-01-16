@@ -9,12 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from app.database import get_db
 from app.models import DistributedTransaction, TransactionLog, DbSession
-from app.schemas import TransactionParticipant
+# from app.schemas import TransactionParticipant
 from app.config import settings
-from utils.logger import setup_logger
-from utils.network import NetworkClient
-from utils.locks import DistributedLock, TransactionLocks
-from utils.clocks import get_clock_manager
+from app.utils.logger import setup_logger
+from app.utils.network import NetworkClient
+from app.utils.locks import DistributedLock, TransactionLocks
+from app.utils.clocks import get_clock_manager
 
 logger = setup_logger(__name__)
 clock_manager = get_clock_manager()  # Assume initialized in startup

@@ -8,10 +8,10 @@ from sqlalchemy import select, text, update
 from app.models import ConsensusState, NodeMetrics
 from app.database import AsyncSessionLocal, get_db
 from app.config import settings
-from utils.logger import setup_logger
-from utils.network import NetworkClient, simulate_network_delay
-from utils.clocks import get_clock_manager
-from utils.locks import DistributedLock
+from app.utils.logger import setup_logger
+from app.utils.network import NetworkClient, simulate_network_delay
+from app.utils.clocks import get_clock_manager
+from app.utils.locks import DistributedLock
 
 logger = setup_logger(__name__)
 clock_manager = get_clock_manager()  # Assume initialized in startup

@@ -2,7 +2,7 @@ from typing import Dict, List, Optional, Tuple
 from pydantic import BaseModel
 import json
 from datetime import datetime
-from utils.logger import setup_logger
+from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 

@@ -7,19 +7,19 @@ import asyncio
 from datetime import datetime
 
 from app.database import get_db
-from app.models import DistributedTransaction, LoadDecision, FaultLogs
+from app.models import DistributedTransaction, LoadDecision, FaultLog
 from app.schemas import (
     TransactionRequest, TransactionResponse, TransactionPrepareResponse,
     LoadBalanceRequest, LoadDecisionResponse, MessageResponse
 )
 from app.config import settings
-from utils.logger import setup_logger
-from utils.network import NetworkClient
-from utils.locks import DistributedLock
-from utils.clocks import get_clock_manager
-from services.transaction import TwoPhaseCommit
-from services.consensus import ConsensusService
-from services.load import LoadBalancer
+from app.utils.logger import setup_logger
+from app.utils.network import NetworkClient
+from app.utils.locks import DistributedLock
+from app.utils.clocks import get_clock_manager
+from app.services.transaction import TwoPhaseCommit
+from app.services.consensus import ConsensusService
+from app.services.load import LoadBalancer
 
 router = APIRouter()
 logger = setup_logger(__name__)
@@ -357,7 +357,7 @@ async def get_system_overview(db: AsyncSession = Depends(get_db)):
         node_metrics = await LoadBalancer.get_all_node_metrics(db)
 
         fault_result = await db.execute(
-            select(FaultLogs).limit(None)
+            select(FaultLog).limit(None)
         )
         faults = len(fault_result.scalars().all())
 

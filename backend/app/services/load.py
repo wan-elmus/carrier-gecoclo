@@ -5,12 +5,13 @@ from typing import Dict, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update
 from app.models import DbSession, LoadDecision, NodeMetrics
-from app.schemas import LoadDecisionResponse
+# from app.schemas import LoadDecisionResponse
 from app.config import settings
-from utils.logger import setup_logger
-from utils.network import NetworkClient
-from utils.locks import DistributedLock
-from utils.clocks import get_clock_manager
+from app.utils.logger import setup_logger
+from app.utils.network import NetworkClient
+from app.utils.locks import DistributedLock
+from app.utils.clocks import get_clock_manager
+from app.database import AsyncSessionLocal
 
 logger = setup_logger(__name__)
 clock_manager = get_clock_manager()  # Assume initialized in startup
@@ -278,42 +279,48 @@ class LoadBalancer:
             await db.rollback()
             logger.error(f"Failed to migrate {session_id}: {e}")
             return False
-
+        
     @staticmethod
-    async def auto_balance_load(db: AsyncSession):
-        """Automatic load balancing: check and migrate sessions if needed"""
-        try:
-            logger.info("Running auto-balance")
+    async def auto_balance_loop():
+        logger.info("Auto-balance loop started")
 
-            metrics = await LoadBalancer.get_all_node_metrics(db)
+        while True:
+            try:
+                async with AsyncSessionLocal() as db:
+                    metrics = await LoadBalancer.get_all_node_metrics(db)
 
-            overloaded = [
-                {"node_id": nid, "cpu_percent": m["cpu_percent"], "active_sessions": m["active_sessions"]}
-                for nid, m in metrics.items() if m["cpu_percent"] > settings.CPU_THRESHOLD_PERCENT
-            ]
-            underloaded = await LoadBalancer.get_underloaded_nodes(db)
+                    overloaded = [
+                        {"node_id": nid, "cpu_percent": m["cpu_percent"], "active_sessions": m["active_sessions"]}
+                        for nid, m in metrics.items()
+                        if m["cpu_percent"] > settings.CPU_THRESHOLD_PERCENT
+                    ]
 
-            if overloaded and underloaded:
-                decisions = await LoadBalancer.make_migration_decisions(overloaded, underloaded, db)
+                    underloaded = await LoadBalancer.get_underloaded_nodes(db)
 
-                successes = 0
-                for decision in decisions:
-                    success = await LoadBalancer.migrate_session(decision["session_id"], decision["target_node"], db)
-                    if success:
-                        successes += 1
-                        source_after = await LoadBalancer.get_node_load(decision["source_node"], db)
-                        target_after = await LoadBalancer.get_node_load(decision["target_node"], db)
-                        await LoadBalancer.update_migration_result(
-                            decision["decision_id"], success, source_after["cpu_percent"], target_after["cpu_percent"], db
-                        )
+                    if overloaded and underloaded:
+                        decisions = await LoadBalancer.make_migration_decisions(overloaded, underloaded, db)
 
-                logger.info(f"Auto-balance: {successes}/{len(decisions)} successful")
+                        for decision in decisions:
+                            success = await LoadBalancer.migrate_session(
+                                decision["session_id"],
+                                decision["target_node"],
+                                db
+                            )
 
-                clock_manager.create_event({"type": "auto_balance", "successes": successes})
+                            if success:
+                                source_after = await LoadBalancer.get_node_load(decision["source_node"], db)
+                                target_after = await LoadBalancer.get_node_load(decision["target_node"], db)
 
-                return successes
-            logger.info("No balancing needed")
-            return 0
-        except Exception as e:
-            logger.error(f"Auto-balance failed: {e}")
-            return 0
+                                await LoadBalancer.update_migration_result(
+                                    decision["decision_id"],
+                                    success,
+                                    source_after["cpu_percent"],
+                                    target_after["cpu_percent"],
+                                    db
+                                )
+
+                await asyncio.sleep(settings.LOAD_BALANCE_INTERVAL_SECONDS)
+
+            except Exception as e:
+                logger.error(f"Auto-balance loop error: {e}", exc_info=True)
+                await asyncio.sleep(5)

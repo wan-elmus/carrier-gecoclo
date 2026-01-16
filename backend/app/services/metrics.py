@@ -8,10 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text
 from app.models import NodeMetrics, SystemMetrics
 from app.config import settings
-from utils.logger import setup_logger, TelecomLogger
-from utils.network import NetworkClient
-from utils.clocks import get_clock_manager
-from utils.locks import DistributedLock
+from app.utils.logger import setup_logger, TelecomLogger
+from app.utils.network import NetworkClient
+from app.utils.clocks import get_clock_manager
+from app.utils.locks import DistributedLock
 from app.database import AsyncSessionLocal
 
 logger = setup_logger(__name__)

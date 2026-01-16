@@ -3,7 +3,7 @@ import asyncio
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 from app.config import settings
-from utils.logger import setup_logger
+from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 

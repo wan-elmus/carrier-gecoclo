@@ -10,11 +10,11 @@ from app.database import get_db
 from app.models import FaultLog
 from app.schemas import FaultInjectionRequest, FaultLogResponse, MessageResponse
 from app.config import settings
-from utils.logger import setup_logger
-from utils.network import NetworkClient
-from utils.locks import DistributedLock
-from utils.clocks import get_clock_manager
-from services.fault import FaultService
+from app.utils.logger import setup_logger
+from app.utils.network import NetworkClient
+from app.utils.locks import DistributedLock
+from app.utils.clocks import get_clock_manager
+from app.services.fault import FaultService
 
 router = APIRouter()
 logger = setup_logger(__name__)
