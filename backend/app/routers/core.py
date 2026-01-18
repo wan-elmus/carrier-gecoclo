@@ -1,3 +1,4 @@
+# app/routers/core.py (corrected - added missing /consensus/heartbeat endpoint)
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -36,29 +37,11 @@ async def begin_transaction(
     try:
         xid = f"tx_{uuid.uuid4().hex[:8]}"
 
-        valid_participants = []
-        for node_id in transaction.participants:
-            if node_id in settings.NODE_URLS:
-                valid_participants.append({
-                    "node_id": node_id,
-                    "url": settings.NODE_URLS[node_id],
-                    "vote": None,
-                    "decided": None
-                })
-            else:
-                logger.warning(f"Unknown participant: {node_id}")
-
-        if not valid_participants:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No valid participants"
-            )
-
         db_transaction = DistributedTransaction(
             xid=xid,
             coordinator_node=settings.NODE_ID,
             status="INIT",
-            participants=valid_participants,
+            participants=transaction.participants,
             transaction_type=transaction.transaction_type,
             timeout_ms=transaction.timeout_ms
         )
@@ -66,7 +49,7 @@ async def begin_transaction(
         await db.commit()
         await db.refresh(db_transaction)
 
-        logger.info(f"Started tx {xid} with {len(valid_participants)} participants")
+        logger.info(f"Started tx {xid} with {len(transaction.participants)} participants")
 
         background_tasks.add_task(
             TwoPhaseCommit.coordinate_transaction,
@@ -102,18 +85,7 @@ async def prepare_transaction(
                     detail=f"Tx {xid} locked"
                 )
 
-            async with NetworkClient() as client:
-                coordinator_data = await client.call_node(
-                    "core_1",  # Assume primary; use backup if failed
-                    f"/core/transaction/{xid}"
-                )
-                if not coordinator_data:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail=f"Tx {xid} not found"
-                    )
-
-            vote = await TwoPhaseCommit.prepare_local(xid, coordinator_data, db)
+            vote = await TwoPhaseCommit.prepare_local(xid, db)
 
             logger.info(f"Node {settings.NODE_ID} voted {vote} for tx {xid}")
 
@@ -217,20 +189,15 @@ async def balance_load(
 ):
     """Make load balancing decision (migrate session between nodes)"""
     try:
-        all_metrics = await LoadBalancer.get_all_node_metrics(db)
-        if not all_metrics:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="No node metrics available"
-            )
+        db_metrics = await LoadBalancer.get_all_node_metrics(db)
 
         overloaded = [
             {"node_id": nid, "cpu_percent": m["cpu_percent"], "active_sessions": m.get("active_sessions", 0)}
-            for nid, m in all_metrics.items() if m.get("cpu_percent", 0) > settings.CPU_THRESHOLD_PERCENT
+            for nid, m in db_metrics.items() if m.get("cpu_percent", 0) > settings.CPU_THRESHOLD_PERCENT
         ]
         underloaded = [
             {"node_id": nid, "cpu_percent": m["cpu_percent"], "capacity": 100 - m["cpu_percent"]}
-            for nid, m in all_metrics.items() if m.get("cpu_percent", 0) < 50
+            for nid, m in db_metrics.items() if m.get("cpu_percent", 0) < 50
         ]
 
         if not underloaded:
@@ -312,6 +279,52 @@ async def vote_consensus(
             detail=f"Failed to process vote: {str(e)}"
         )
 
+@router.post("/consensus/heartbeat", response_model=Dict)
+async def receive_heartbeat(
+    heartbeat: Dict,
+    db: AsyncSession = Depends(get_db)
+):
+    """Receive heartbeat from leader and update local state"""
+    try:
+        term = heartbeat.get("term")
+        leader_id = heartbeat.get("leader_id")
+        if not term or not leader_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing term or leader_id"
+            )
+
+        # Validate term is >= current
+        from app.services.consensus import get_consensus_service
+        service = get_consensus_service()
+        if term < service.current_term:
+            return {"term": service.current_term, "success": False, "reason": "Stale term"}
+
+        # Update last heartbeat and leader
+        service.last_heartbeat = datetime.utcnow()
+        service.leader_id = leader_id
+        service.current_term = max(service.current_term, term)
+        await service._save_state(db)
+
+        logger.debug(f"Heartbeat received from {leader_id} for term {term}")
+
+        clock_manager.create_event({"type": "heartbeat_received", "leader": leader_id})
+
+        return {
+            "success": True,
+            "term": service.current_term,
+            "node_id": settings.NODE_ID,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to process heartbeat: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process heartbeat: {str(e)}"
+        )
+
 @router.post("/consensus/leader", response_model=Dict)
 async def announce_leader(
     announcement: Dict,
@@ -366,7 +379,7 @@ async def get_system_overview(db: AsyncSession = Depends(get_db)):
         )
         active_transactions = len(active_tx_result.scalars().all())
 
-        total_nodes = len(node_metrics)
+        total_nodes = len(node_metrics) or 1
         healthy_nodes = sum(1 for m in node_metrics.values() if m.get("cpu_percent", 100) < 90)
         system_health = (healthy_nodes / total_nodes * 100) if total_nodes > 0 else 0
 

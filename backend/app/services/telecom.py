@@ -16,17 +16,14 @@ from app.services.replication import ReplicationService
 from app.database import AsyncSessionLocal
 
 logger = setup_logger(__name__)
-clock_manager = get_clock_manager()  # Assume initialized in startup
+clock_manager = get_clock_manager()
 
 class TelecomService:
-    """Telecom business logic and operations"""
-
     @staticmethod
     async def create_subscriber(
         subscriber_data: SubscriberCreate,
         db: AsyncSession
     ) -> Subscriber:
-        """Create a new telecom subscriber with validation (called from edge /subscribers POST)"""
         try:
             result = await db.execute(
                 select(Subscriber).where(Subscriber.subscriber_id == subscriber_data.subscriber_id)
@@ -62,11 +59,12 @@ class TelecomService:
         session_data: SessionCreate,
         db: AsyncSession
     ) -> DbSession:
-        """Setup a new telecom session with QoS (called from edge /sessions/start)"""
         try:
             result = await db.execute(
-                select(Subscriber).where(Subscriber.subscriber_id == session_data.subscriber_id)
-                .where(Subscriber.status == "ACTIVE")
+                select(Subscriber).where(
+                    Subscriber.subscriber_id == session_data.subscriber_id,
+                    Subscriber.status == "ACTIVE"
+                )
             )
             subscriber = result.scalar_one_or_none()
             if not subscriber:
@@ -78,16 +76,26 @@ class TelecomService:
 
             session = DbSession(
                 session_id=session_id,
-                **session_data.model_dump(),
+                subscriber_id=session_data.subscriber_id,
+                session_type=session_data.session_type,
                 source_node=settings.NODE_ID,
                 current_node=settings.NODE_ID,
-                latency_threshold_ms=threshold
+                destination_node=session_data.destination_node,
+                qos_profile=session_data.qos_profile or {},
+                latency_threshold_ms=threshold,
+                start_time=datetime.utcnow(),
+                end_time=None,
+                data_volume=0,
+                migrated_from=None,
+                migration_count=0,
+                status="ACTIVE"
             )
+
             db.add(session)
             await db.commit()
             await db.refresh(session)
 
-            logger.info(f"Setup {session.session_type} session {session_id} for {session.subscriber_id}")
+            logger.info(f"Setup {session.session_type} session {session_id} for {session.subscriber_id} on {settings.NODE_ID}")
 
             await TelecomService._log_transaction(
                 "CREATE_SESSION", "sessions", session_id,
@@ -96,16 +104,13 @@ class TelecomService:
 
             clock_manager.create_event({"type": "session_setup", "id": session_id})
 
-            asyncio.create_task(TelecomService.monitor_session_qos(session_id, threshold))
-
-            asyncio.create_task(TelecomService.replicate_to_core(session, "CREATE"))
-
             return session
+
         except Exception as e:
             await db.rollback()
-            logger.error(f"Failed to setup session: {e}")
+            logger.error(f"Failed to setup session for {session_data.subscriber_id}: {e}", exc_info=True)
             raise
-        
+
     @staticmethod
     async def monitor_session_qos(session_id: str, threshold_ms: int):
         logger.info(f"QoS monitor started for {session_id}")
@@ -114,8 +119,8 @@ class TelecomService:
             try:
                 async with AsyncSessionLocal() as db:
                     result = await db.execute(
-                            select(DbSession).where(DbSession.session_id == session_id)
-                        )
+                        select(DbSession).where(DbSession.session_id == session_id)
+                    )
                     session = result.scalar_one_or_none()
                     if not session or session.status != "ACTIVE":
                         break
@@ -135,17 +140,14 @@ class TelecomService:
 
         logger.info(f"QoS monitoring stopped for {session_id}")
 
-
     @staticmethod
     def _get_latency_threshold(session_type: str, qos_profile: Dict) -> int:
-        """Determine latency threshold (used in setup_session)"""
         defaults = {"VOICE": 150, "DATA": 300, "SMS": 1000, "SIGNALING": 100}
         threshold = defaults.get(session_type, 300)
         return qos_profile.get("max_latency_ms", threshold)
 
     @staticmethod
     async def _record_qos_violation(session_id: str, actual: float, threshold: int, db: AsyncSession):
-        """Record QoS violation (called from monitor_session_qos)"""
         try:
             await TelecomService._log_transaction(
                 "QOS_VIOLATION", "sessions", session_id,
@@ -160,7 +162,6 @@ class TelecomService:
         target_node: str,
         db: AsyncSession
     ) -> bool:
-        """Handover session to another node (called from edge /sessions/migrate or core /load/balance)"""
         try:
             async with DistributedLock("session", session_id) as lock:
                 if not await lock.acquire(timeout_ms=5000):
@@ -205,7 +206,6 @@ class TelecomService:
 
     @staticmethod
     async def terminate_session(session_id: str, db: AsyncSession) -> bool:
-        """Terminate a telecom session (called from edge /sessions/end)"""
         try:
             result = await db.execute(
                 select(DbSession).where(DbSession.session_id == session_id)
@@ -239,9 +239,15 @@ class TelecomService:
             return False
 
     @staticmethod
-    async def calculate_current_latency(session_id: str) -> float:
+    async def calculate_current_latency(session_id: str, db: AsyncSession = None) -> float:
         try:
-            async with AsyncSessionLocal() as db:
+            if db is None:
+                async with AsyncSessionLocal() as db_temp:
+                    result = await db_temp.execute(
+                        select(DbSession.current_node).where(DbSession.session_id == session_id)
+                    )
+                    current_node = result.scalar()
+            else:
                 result = await db.execute(
                     select(DbSession.current_node).where(DbSession.session_id == session_id)
                 )
@@ -260,21 +266,19 @@ class TelecomService:
 
     @staticmethod
     def _simulate_current_latency() -> float:
-        """Simulate latency as fallback (used in calculate_current_latency)"""
         hour = datetime.utcnow().hour
         base = 50 + (10 if 9 <= hour <= 17 else 0)
         return max(20, base + random.uniform(-10, 20))
 
     @staticmethod
     async def replicate_to_core(data: Any, operation: str):
-        """Replicate data to core node (called from edge create_subscriber/setup_session/handover/terminate)"""
         try:
             async with NetworkClient() as client:
                 response = await client.call_node(
-                    "core_1",  # Primary; fallback to core_2 if needed
+                    "core_1",
                     "/data/replicate",
                     method="POST",
-                    data={"source_node": settings.NODE_ID, "operation": operation, "data": data.model_dump()}
+                    data={"source_node": settings.NODE_ID, "operation": operation, "data": data.model_dump() if hasattr(data, 'model_dump') else data.__dict__}
                 )
                 if response:
                     logger.debug(f"Replicated {operation} to core")
@@ -292,7 +296,6 @@ class TelecomService:
         new_state: Dict,
         db: AsyncSession
     ):
-        """Log transaction for recovery (called from all create/update ops)"""
         try:
             log = TransactionLog(
                 transaction_id=str(uuid.uuid4()),
@@ -311,7 +314,6 @@ class TelecomService:
 
     @staticmethod
     async def get_session_statistics(db: AsyncSession) -> Dict[str, Any]:
-        """Get session statistics for monitoring (called from core /system/overview or metrics /telecom)"""
         try:
             active_result = await db.execute(select(func.count()).select_from(DbSession).where(DbSession.status == "ACTIVE"))
             active_sessions = active_result.scalar() or 0

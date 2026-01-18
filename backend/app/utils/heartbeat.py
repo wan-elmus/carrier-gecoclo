@@ -7,6 +7,7 @@ from sqlalchemy import text
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.utils.logger import setup_logger, TelecomLogger
+# from app.services.metrics import MetricsService
 
 logger = setup_logger(__name__)
 telecom_logger = TelecomLogger()
@@ -35,6 +36,14 @@ class HeartbeatManager:
             async with AsyncSessionLocal() as session:
                 metrics = await self.node_health.collect_metrics()
                 try:
+                    # Set correct schema depending on node type
+                    schema = {
+                        "edge": "edge_schema",
+                        "core": "core_schema",
+                        "cloud": "cloud_schema",
+                        "monitoring": "monitoring_schema"
+                    }.get(settings.NODE_TYPE, "public")
+                    # Store to consensus_state (existing)
                     await session.execute(
                         text("""
                             INSERT INTO shared_schema.consensus_state 
@@ -53,6 +62,14 @@ class HeartbeatManager:
                             "memory": metrics["memory_percent"]
                         }
                     )
+                    # Also store to node_metrics table
+                    from app.services.metrics import MetricsService
+                    await MetricsService.store_node_metrics({
+                        "cpu_percent": metrics["cpu_percent"],
+                        "memory_percent": metrics["memory_percent"],
+                        "latency_ms": 0,  # Simulated or from elsewhere
+                        "throughput_rps": 0  # Simulated
+                    }, session)
                     await session.commit()
                 except Exception as e:
                     logger.error(f"Heartbeat DB update failed (ignored): {e}")
@@ -66,7 +83,7 @@ class HeartbeatManager:
             result = await session.execute(
                 text("""
                     SELECT node_id, last_heartbeat 
-                    FROM shared_schema.consensus_state 
+                    FROM consensus_state 
                     WHERE last_heartbeat < NOW() - :timeout * INTERVAL '1 second'
                     AND status != 'FAILED'
                 """),
@@ -76,12 +93,12 @@ class HeartbeatManager:
                 node_id, last = row
                 logger.warning(f"Node {node_id} failed (last: {last})")
                 await session.execute(
-                    text("UPDATE shared_schema.consensus_state SET status = 'FAILED' WHERE node_id = :nid"),
+                    text("UPDATE consensus_state SET status = 'FAILED' WHERE node_id = :nid"),
                     {"nid": node_id}
                 )
                 await session.execute(
                     text("""
-                        INSERT INTO monitoring_schema.fault_logs 
+                        INSERT INTO fault_logs 
                         (node_id, fault_type, injected_at, detected_at)
                         VALUES (:nid, 'crash', NOW(), NOW())
                     """),

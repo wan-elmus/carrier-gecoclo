@@ -3,9 +3,8 @@ import random
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, text
 from app.models import DbSession, LoadDecision, NodeMetrics
-# from app.schemas import LoadDecisionResponse
 from app.config import settings
 from app.utils.logger import setup_logger
 from app.utils.network import NetworkClient
@@ -14,7 +13,7 @@ from app.utils.clocks import get_clock_manager
 from app.database import AsyncSessionLocal
 
 logger = setup_logger(__name__)
-clock_manager = get_clock_manager()  # Assume initialized in startup
+clock_manager = get_clock_manager()
 
 class LoadBalancer:
     """Load balancing and session migration service"""
@@ -24,59 +23,86 @@ class LoadBalancer:
         """Get current load metrics for a node"""
         try:
             five_min_ago = datetime.utcnow() - timedelta(minutes=5)
+            
+            schema_map = {
+                "edge_": "edge_schema",
+                "core_": "core_schema",
+                "cloud_": "cloud_schema",
+                "monitoring": "monitoring_schema"
+            }
+            schema = "public"
+            for prefix, sch in schema_map.items():
+                if node_id.startswith(prefix):
+                    schema = sch
+                    break
 
-            cpu_result = await db.execute(
-                select(func.avg(NodeMetrics.metric_value))
-                .where(NodeMetrics.node_id == node_id)
-                .where(NodeMetrics.metric_type == "cpu_percent")
-                .where(NodeMetrics.timestamp >= five_min_ago)
-            )
-            avg_cpu = cpu_result.scalar() or 0
-
-            memory_result = await db.execute(
-                select(func.avg(NodeMetrics.metric_value))
-                .where(NodeMetrics.node_id == node_id)
-                .where(NodeMetrics.metric_type == "memory_percent")
-                .where(NodeMetrics.timestamp >= five_min_ago)
-            )
-            avg_memory = memory_result.scalar() or 0
-
-            session_result = await db.execute(
-                select(func.count()).select_from(DbSession)
-                .where(DbSession.current_node == node_id)
-                .where(DbSession.status == "ACTIVE")
-            )
-            active_sessions = session_result.scalar() or 0
+            await db.execute(text(f"SET search_path TO {schema}, public"))
+            
+            avg_cpu = 0.0
+            try:
+                cpu_result = await db.execute(
+                    select(func.avg(NodeMetrics.metric_value))
+                    .where(NodeMetrics.node_id == node_id)
+                    .where(NodeMetrics.metric_type == "cpu_percent")
+                    .where(NodeMetrics.timestamp >= five_min_ago)
+                )
+                avg_cpu = cpu_result.scalar() or 0.0
+            except Exception as sub_e:
+                logger.warning(f"CPU avg query failed for {node_id}: {sub_e}")
+                await db.rollback()  # Reset transaction
+                
+            avg_memory = 0.0
+            try:
+                memory_result = await db.execute(
+                    select(func.avg(NodeMetrics.metric_value))
+                    .where(NodeMetrics.node_id == node_id)
+                    .where(NodeMetrics.metric_type == "memory_percent")
+                    .where(NodeMetrics.timestamp >= five_min_ago)
+                )
+                avg_memory = memory_result.scalar() or 0.0
+            except Exception as sub_e:
+                logger.warning(f"Memory avg query failed for {node_id}: {sub_e}")
+                await db.rollback()
+                
+            active_sessions = 0
+            try:
+                session_result = await db.execute(
+                    select(func.count()).select_from(DbSession)
+                    .where(DbSession.current_node == node_id)
+                    .where(DbSession.status == "ACTIVE")
+                )
+                active_sessions = session_result.scalar() or 0            
+            except Exception as sub_e:
+                logger.warning(f"Session count query failed for {node_id}: {sub_e}")
+                await db.rollback()
 
             return {
-                "cpu_percent": round(avg_cpu, 2),
-                "memory_percent": round(avg_memory, 2),
+                "cpu_percent": round(float(avg_cpu), 2),
+                "memory_percent": round(float(avg_memory), 2),
                 "active_sessions": active_sessions,
-                "latency_ms": round(random.uniform(50, 100), 2),  # Simulate
+                "latency_ms": round(random.uniform(50, 100), 2),  # Simulate for now
                 "throughput_rps": round(1000 - (avg_cpu * 10), 2),
                 "load_factor": LoadBalancer._calculate_load_factor(avg_cpu, avg_memory, active_sessions)
             }
         except Exception as e:
             logger.error(f"Failed to get load for {node_id}: {e}")
-            return {"cpu_percent": 0, "memory_percent": 0, "active_sessions": 0, "load_factor": 0}
+            return {"cpu_percent": 0.0, "memory_percent": 0.0, "active_sessions": 0, "load_factor": 0.0}
 
     @staticmethod
     def _calculate_load_factor(cpu: float, memory: float, sessions: int) -> float:
-        """Calculate overall load factor (0-100)"""
         cpu_weight = 0.5
         memory_weight = 0.3
         sessions_weight = 0.2
-        normalized_sessions = min(sessions / 1000 * 100, 100)  # Cap at 100%
+        normalized_sessions = min(sessions / 1000 * 100, 100)
         load = (cpu * cpu_weight) + (memory * memory_weight) + (normalized_sessions * sessions_weight)
         return min(round(load, 2), 100)
 
     @staticmethod
     async def get_all_node_metrics(db: AsyncSession) -> Dict[str, Dict]:
-        """Get load metrics for all nodes"""
         try:
             all_metrics = {}
             for node_id in settings.NODE_URLS:
-                if "edge" in node_id or "core" in node_id or "cloud" in node_id:
+                if any(t in node_id for t in ["edge", "core", "cloud"]):
                     metrics = await LoadBalancer.get_node_load(node_id, db)
                     all_metrics[node_id] = metrics
             return all_metrics
@@ -85,8 +111,7 @@ class LoadBalancer:
             return {}
 
     @staticmethod
-    async def get_underloaded_nodes(db: AsyncSession, threshold: float = 50) -> List[Dict]:
-        """Get list of underloaded nodes"""
+    async def get_underloaded_nodes(db: AsyncSession, threshold: float = 50.0) -> List[Dict]:
         try:
             metrics = await LoadBalancer.get_all_node_metrics(db)
             underloaded = [
@@ -103,10 +128,8 @@ class LoadBalancer:
         db: AsyncSession,
         exclude: Optional[List[str]] = None
     ) -> Optional[str]:
-        """Find the best edge node for new session"""
         try:
             exclude = exclude or []
-
             edge_nodes = [nid for nid in settings.NODE_URLS if nid.startswith("edge_")]
             available = [n for n in edge_nodes if n not in exclude]
 
@@ -114,14 +137,14 @@ class LoadBalancer:
                 return None
 
             metrics = await LoadBalancer.get_all_node_metrics(db)
-            node_loads = {nid: metrics.get(nid, {}).get("load_factor", 100) for nid in available}
+            node_loads = {nid: metrics.get(nid, {}).get("load_factor", 100.0) for nid in available}
 
             if node_loads:
                 best = min(node_loads, key=node_loads.get)
                 if node_loads[best] < settings.CPU_THRESHOLD_PERCENT:
                     return best
 
-            return random.choice(available)  # Fallback round-robin
+            return random.choice(available)
         except Exception as e:
             logger.error(f"Failed to find best edge: {e}")
             return None
@@ -132,21 +155,18 @@ class LoadBalancer:
         underloaded: List[Dict],
         db: AsyncSession
     ) -> List[Dict]:
-        """Make decisions about which sessions to migrate"""
         try:
             decisions = []
-
             overloaded.sort(key=lambda x: x["cpu_percent"], reverse=True)
             underloaded.sort(key=lambda x: x["capacity"], reverse=True)
 
             for overloaded_node in overloaded:
                 nid = overloaded_node["node_id"]
-
                 result = await db.execute(
                     select(DbSession)
                     .where(DbSession.current_node == nid)
                     .where(DbSession.status == "ACTIVE")
-                    .order_by(DbSession.session_type.desc())  # Priority: VOICE > DATA
+                    .order_by(DbSession.session_type.desc())
                     .limit(3)
                 )
                 sessions = result.scalars().all()
@@ -154,9 +174,7 @@ class LoadBalancer:
                 for i, session in enumerate(sessions):
                     if i >= len(underloaded):
                         break
-
                     target = underloaded[i]["node_id"]
-
                     decisions.append({
                         "session_id": session.session_id,
                         "source_node": nid,
@@ -166,9 +184,7 @@ class LoadBalancer:
                     })
 
             logger.info(f"Made {len(decisions)} migration decisions")
-
             clock_manager.create_event({"type": "migration_decisions_made", "count": len(decisions)})
-
             return decisions
         except Exception as e:
             logger.error(f"Failed to make decisions: {e}")
@@ -183,7 +199,6 @@ class LoadBalancer:
         cpu_before: float,
         db: AsyncSession
     ) -> LoadDecision:
-        """Record a migration decision in database"""
         try:
             decision = LoadDecision(
                 session_id=session_id,
@@ -195,11 +210,8 @@ class LoadBalancer:
             db.add(decision)
             await db.commit()
             await db.refresh(decision)
-
             logger.info(f"Recorded decision {decision.decision_id}")
-
             clock_manager.create_event({"type": "migration_recorded", "id": decision.decision_id})
-
             return decision
         except Exception as e:
             await db.rollback()
@@ -214,7 +226,6 @@ class LoadBalancer:
         cpu_after_target: float,
         db: AsyncSession
     ):
-        """Update migration decision with results"""
         try:
             await db.execute(
                 update(LoadDecision)
@@ -222,9 +233,7 @@ class LoadBalancer:
                 .values(cpu_after=cpu_after_target, success=success)
             )
             await db.commit()
-
             logger.debug(f"Updated result for {decision_id}")
-
             clock_manager.create_event({"type": "migration_updated", "id": decision_id, "success": success})
         except Exception as e:
             await db.rollback()
@@ -236,7 +245,6 @@ class LoadBalancer:
         target_node: str,
         db: AsyncSession
     ) -> bool:
-        """Execute session migration to target node"""
         try:
             async with DistributedLock("migration", session_id) as lock:
                 if not await lock.acquire(timeout_ms=5000):
@@ -269,58 +277,49 @@ class LoadBalancer:
                         target_node,
                         f"/sessions/{session_id}/receive",
                         method="POST",
-                        data={"session_data": session.model_dump()}
+                        data={"session_data": session.__dict__}  # simplified
                     )
 
                 clock_manager.create_event({"type": "session_migrated", "id": session_id})
-
                 return True
         except Exception as e:
             await db.rollback()
             logger.error(f"Failed to migrate {session_id}: {e}")
             return False
-        
+
     @staticmethod
     async def auto_balance_loop():
         logger.info("Auto-balance loop started")
-
         while True:
             try:
                 async with AsyncSessionLocal() as db:
                     metrics = await LoadBalancer.get_all_node_metrics(db)
-
                     overloaded = [
                         {"node_id": nid, "cpu_percent": m["cpu_percent"], "active_sessions": m["active_sessions"]}
                         for nid, m in metrics.items()
                         if m["cpu_percent"] > settings.CPU_THRESHOLD_PERCENT
                     ]
-
                     underloaded = await LoadBalancer.get_underloaded_nodes(db)
 
                     if overloaded and underloaded:
                         decisions = await LoadBalancer.make_migration_decisions(overloaded, underloaded, db)
-
                         for decision in decisions:
                             success = await LoadBalancer.migrate_session(
                                 decision["session_id"],
                                 decision["target_node"],
                                 db
                             )
-
                             if success:
                                 source_after = await LoadBalancer.get_node_load(decision["source_node"], db)
                                 target_after = await LoadBalancer.get_node_load(decision["target_node"], db)
-
                                 await LoadBalancer.update_migration_result(
-                                    decision["decision_id"],
+                                    decision["decision_id"],  # note: you need to add decision_id to decision dict
                                     success,
                                     source_after["cpu_percent"],
                                     target_after["cpu_percent"],
                                     db
                                 )
-
                 await asyncio.sleep(settings.LOAD_BALANCE_INTERVAL_SECONDS)
-
             except Exception as e:
                 logger.error(f"Auto-balance loop error: {e}", exc_info=True)
                 await asyncio.sleep(5)

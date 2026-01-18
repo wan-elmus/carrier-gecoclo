@@ -24,14 +24,13 @@ from app.services.load import LoadBalancer
 router = APIRouter()
 logger = setup_logger(__name__)
 
-clock_manager = get_clock_manager()  # Assume initialized in startup
+clock_manager = get_clock_manager()
 
 @router.post("/subscribers", response_model=SubscriberResponse, status_code=status.HTTP_201_CREATED)
 async def create_subscriber(
     subscriber: SubscriberCreate,
     db: AsyncSession = Depends(get_db)
 ):
-    """Create a new telecom subscriber (simulating HLR registration)"""
     try:
         result = await db.execute(
             select(Subscriber).where(Subscriber.subscriber_id == subscriber.subscriber_id)
@@ -57,10 +56,8 @@ async def create_subscriber(
 
         logger.info(f"Created subscriber {subscriber.subscriber_id} on node {settings.NODE_ID}")
 
-        # Replicate to core (async)
         asyncio.create_task(TelecomService.replicate_to_core(db_subscriber, "CREATE"))
 
-        # Event with vector clock
         clock_manager.create_event({"type": "subscriber_created", "id": subscriber.subscriber_id})
 
         return db_subscriber
@@ -79,7 +76,6 @@ async def get_subscriber(
     subscriber_id: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get subscriber information"""
     try:
         result = await db.execute(
             select(Subscriber).where(Subscriber.subscriber_id == subscriber_id)
@@ -106,17 +102,32 @@ async def start_session(
     db: AsyncSession = Depends(get_db)
 ):
     try:
+        logger.debug(f"Starting session for subscriber {session.subscriber_id} type {session.session_type}")
+
         db_session = await TelecomService.setup_session(session, db)
+
+        asyncio.create_task(TelecomService.monitor_session_qos(db_session.session_id, db))
+
+        logger.info(f"Session {db_session.session_id} started successfully for {session.subscriber_id}")
         return db_session
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+
+    except ValueError as ve:
+        logger.warning(f"Session start validation failed: {ve}")
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Session start failed for {session.subscriber_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to start session: {str(e)}"
+        )
 
 @router.get("/sessions/{session_id}", response_model=SessionResponse)
 async def get_session_status(
     session_id: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get session status and metrics"""
     try:
         result = await db.execute(
             select(DbSession).where(DbSession.session_id == session_id)
@@ -134,7 +145,7 @@ async def get_session_status(
         current_latency = await TelecomService.calculate_current_latency(session_id)
 
         response = SessionResponse.model_validate(db_session)
-        response.current_latency_ms = current_latency  # Assuming SessionResponse extended with this field
+        response.current_latency_ms = current_latency
 
         return response
     except HTTPException:
@@ -176,7 +187,6 @@ async def end_session(
 
 @router.get("/load", response_model=Dict)
 async def get_edge_load(db: AsyncSession = Depends(get_db)):
-    """Get current edge node load metrics"""
     try:
         load_metrics = await LoadBalancer.get_node_load(settings.NODE_ID, db)
 

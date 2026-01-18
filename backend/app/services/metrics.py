@@ -1,3 +1,4 @@
+# app/services/metrics.py (corrected - change /metrics/node call to GET, fix timestamp type in store)
 import asyncio
 import csv
 from datetime import datetime, timedelta
@@ -16,14 +17,11 @@ from app.database import AsyncSessionLocal
 
 logger = setup_logger(__name__)
 telecom_logger = TelecomLogger()
-clock_manager = get_clock_manager()  # Assume initialized in startup
+clock_manager = get_clock_manager()
 
 class MetricsService:
-    """Metrics collection and analysis service"""
-
     @staticmethod
     async def collect_node_metrics() -> Dict[str, float]:
-        """Collect current node metrics"""
         try:
             cpu_percent = psutil.cpu_percent(interval=0.5)
             memory = psutil.virtual_memory()
@@ -42,6 +40,8 @@ class MetricsService:
                 "disk_write_mb": round(disk_write_mb, 2),
                 "network_sent_mb": round(net_sent_mb, 2),
                 "network_recv_mb": round(net_recv_mb, 2),
+                "latency_ms": 0,  # Add default for missing key
+                "throughput_rps": 0,  # Add default
                 "timestamp": datetime.utcnow().isoformat()
             }
 
@@ -58,63 +58,79 @@ class MetricsService:
             return metrics
         except Exception as e:
             logger.error(f"Collect node metrics failed: {e}")
-            return {}
+            return {"cpu_percent": 0, "memory_percent": 0, "active_sessions": 0, "latency_ms": 0, "throughput_rps": 0, "timestamp": datetime.utcnow().isoformat()}
 
     @staticmethod
     async def store_node_metrics(metrics: Dict[str, float], db: AsyncSession):
-        """Store node metrics in database"""
         try:
             async with DistributedLock("metrics_store", settings.NODE_ID) as lock:
                 if not await lock.acquire(timeout_ms=3000):
                     raise ValueError("Metrics store locked")
+                
+                schema_map = {
+                    "edge": "edge_schema",
+                    "core": "core_schema",
+                    "cloud": "cloud_schema",
+                    "monitoring": "monitoring_schema"
+                }
+                target_schema = schema_map.get(settings.NODE_TYPE, "public")
 
-                for m_type, value in metrics.items():
-                    if m_type != "timestamp":
-                        metric = NodeMetrics(
-                            node_id=settings.NODE_ID,
-                            metric_type=m_type,
-                            metric_value=value
-                        )
-                        db.add(metric)
+                await db.execute(text(f"SET search_path TO {target_schema}, public"))
+                
+                from app.models import NodeMetrics
+                original_schema = NodeMetrics.__table__.schema
+                NodeMetrics.__table__.schema = target_schema
+                
+                try:
+                    added_count = 0
+                    for m_type, value in metrics.items():
+                        if m_type != "timestamp":
+                            metric = NodeMetrics(
+                                node_id=settings.NODE_ID,
+                                metric_type=m_type,
+                                metric_value=value
+                            )
+                            db.add(metric)
+                            added_count += 1
+                    
+                    if added_count > 0:
+                        await db.commit()
+                        logger.info(f"Stored {added_count} metrics for {settings.NODE_ID} in {target_schema}.node_metrics")
+                        clock_manager.create_event({"type": "metrics_stored", "count": added_count})
+                    else:
+                        logger.debug("No valid metrics to store")
+                finally:
+                    NodeMetrics.__table__.schema = original_schema
 
-                await db.commit()
-            logger.debug(f"Stored metrics for {settings.NODE_ID}")
-
-            clock_manager.create_event({"type": "metrics_stored"})
         except Exception as e:
             await db.rollback()
-            logger.warning(f"Store metrics failed: {e}")
+            logger.error(f"Store metrics failed for {settings.NODE_ID}: {e}", exc_info=True)
 
     @staticmethod
     async def collect_system_metrics():
-        """Collect system-wide metrics (for monitoring node, run in background from startup)"""
-        try:
-            logger.info("Starting system metrics collection")
+        logger.info("Starting system metrics collection")
 
-            while True:
-                all_metrics = await MetricsService._collect_all_node_metrics()
+        while True:
+            all_metrics = await MetricsService._collect_all_node_metrics()
 
-                if all_metrics:
-                    aggregated = await MetricsService._aggregate_metrics(all_metrics)
-                    await MetricsService._store_system_metrics(aggregated)
-                    await MetricsService._export_metrics_to_csv(aggregated)
+            if all_metrics:
+                aggregated = await MetricsService._aggregate_metrics(all_metrics)
+                await MetricsService._store_system_metrics(aggregated)
+                await MetricsService._export_metrics_to_csv(aggregated)
 
-                await asyncio.sleep(60)
-        except Exception as e:
-            logger.error(f"System collection failed: {e}")
+            await asyncio.sleep(60)
 
     @staticmethod
     async def _collect_all_node_metrics() -> Dict[str, Dict]:
-        """Collect metrics from all nodes"""
         try:
             all_metrics = {}
             async with NetworkClient() as client:
                 for nid, url in settings.NODE_URLS.items():
-                    metrics = await client.call_node(nid, "/metrics/node")
+                    metrics = await client.call_node(nid, "/metrics/node", method="GET")  # Changed to GET
                     if metrics:
                         all_metrics[nid] = metrics
                     else:
-                        all_metrics[nid] = {"cpu_percent": 0, "memory_percent": 0, "active_sessions": 0}
+                        all_metrics[nid] = {"cpu_percent": 0, "memory_percent": 0, "active_sessions": 0, "latency_ms": 0, "throughput_rps": 0}
             return all_metrics
         except Exception as e:
             logger.error(f"Collect all metrics failed: {e}")
@@ -122,18 +138,17 @@ class MetricsService:
 
     @staticmethod
     async def _aggregate_metrics(all_metrics: Dict[str, Dict]) -> Dict[str, float]:
-        """Aggregate metrics from all nodes"""
         try:
-            edge_cpus = [m["cpu_percent"] for nid, m in all_metrics.items() if "edge" in nid]
-            core_cpus = [m["cpu_percent"] for nid, m in all_metrics.items() if "core" in nid]
-            cloud_cpus = [m["cpu_percent"] for nid, m in all_metrics.items() if "cloud" in nid]
+            edge_cpus = [m.get("cpu_percent", 0) for nid, m in all_metrics.items() if "edge" in nid and m]
+            core_cpus = [m.get("cpu_percent", 0) for nid, m in all_metrics.items() if "core" in nid and m]
+            cloud_cpus = [m.get("cpu_percent", 0) for nid, m in all_metrics.items() if "cloud" in nid and m]
 
             edge_cpu_avg = sum(edge_cpus) / len(edge_cpus) if edge_cpus else 0
             core_cpu_avg = sum(core_cpus) / len(core_cpus) if core_cpus else 0
             cloud_cpu_avg = sum(cloud_cpus) / len(cloud_cpus) if cloud_cpus else 0
 
-            latency_avg = sum(m["latency_ms"] for m in all_metrics.values()) / len(all_metrics) if all_metrics else 0
-            tx_rate = sum(m["throughput_rps"] for m in all_metrics.values())  # Simulate tx_rate
+            latency_avg = sum(m.get("latency_ms", 0) for m in all_metrics.values() if m) / len(all_metrics) if all_metrics else 0
+            tx_rate = sum(m.get("throughput_rps", 0) for m in all_metrics.values() if m)  
 
             return {
                 "edge_cpu_avg": round(edge_cpu_avg, 2),
@@ -141,8 +156,8 @@ class MetricsService:
                 "cloud_cpu_avg": round(cloud_cpu_avg, 2),
                 "overall_latency_avg": round(latency_avg, 2),
                 "transaction_rate": int(tx_rate),
-                "packet_loss_rate": 0,  # Simulate
-                "timestamp": datetime.utcnow().isoformat()
+                "packet_loss_rate": 0,
+                "timestamp": datetime.utcnow()  # Changed to datetime object
             }
         except Exception as e:
             logger.error(f"Aggregate metrics failed: {e}")
@@ -150,16 +165,19 @@ class MetricsService:
 
     @staticmethod
     async def _store_system_metrics(metrics: Dict[str, float]):
-        """Store system metrics in monitoring schema"""
         try:
             async with AsyncSessionLocal() as db:
                 await db.execute(text("SET search_path TO monitoring_schema,public"))
+
+                # Parse timestamp if str
+                if isinstance(metrics["timestamp"], str):
+                    metrics["timestamp"] = datetime.fromisoformat(metrics["timestamp"])
 
                 system_metric = SystemMetrics(**metrics)
                 db.add(system_metric)
                 await db.commit()
 
-            logger.debug(f"Stored system metrics at {metrics['timestamp']}")
+            logger.debug(f"Stored system metrics at {metrics.get('timestamp', 'unknown')}")
 
             clock_manager.create_event({"type": "system_metrics_stored"})
         except Exception as e:
@@ -167,7 +185,6 @@ class MetricsService:
 
     @staticmethod
     async def _export_metrics_to_csv(metrics: Dict[str, float]):
-        """Export metrics to CSV file for analysis"""
         try:
             csv_path = Path("logs/system_metrics.csv")
             csv_path.parent.mkdir(exist_ok=True)
@@ -192,7 +209,6 @@ class MetricsService:
         end_time: datetime,
         db: AsyncSession
     ) -> Dict:
-        """Generate performance report for time period"""
         try:
             await db.execute(text("SET search_path TO monitoring_schema,public"))
 
@@ -254,33 +270,8 @@ class MetricsService:
 
     @staticmethod
     async def cleanup_old_metrics(days_to_keep: int = 7, db: AsyncSession = None):
-        """Clean up old metrics data"""
-        try:
-            if db is None:
-                async with AsyncSessionLocal() as session:
-                    cutoff = datetime.utcnow() - timedelta(days=days_to_keep)
-
-                    await session.execute(
-                        text("""
-                            DELETE FROM node_metrics
-                            WHERE timestamp < :cutoff
-                        """),
-                        {"cutoff": cutoff}
-                    )
-
-                    await session.execute(text("SET search_path TO monitoring_schema,public"))
-
-                    await session.execute(
-                        text("""
-                            DELETE FROM system_metrics
-                            WHERE timestamp < :cutoff
-                        """),
-                        {"cutoff": cutoff}
-                    )
-
-                    await session.commit()
-            else:
-                session = db
+        if db is None:
+            async with AsyncSessionLocal() as session:
                 cutoff = datetime.utcnow() - timedelta(days=days_to_keep)
 
                 await session.execute(
@@ -302,9 +293,30 @@ class MetricsService:
                 )
 
                 await session.commit()
+        else:
+            session = db
+            cutoff = datetime.utcnow() - timedelta(days=days_to_keep)
 
-            logger.info(f"Cleaned metrics older than {days_to_keep} days")
+            await session.execute(
+                text("""
+                    DELETE FROM node_metrics
+                    WHERE timestamp < :cutoff
+                """),
+                {"cutoff": cutoff}
+            )
 
-            clock_manager.create_event({"type": "metrics_cleaned"})
-        except Exception as e:
-            logger.error(f"Cleanup failed: {e}")
+            await session.execute(text("SET search_path TO monitoring_schema,public"))
+
+            await session.execute(
+                text("""
+                    DELETE FROM system_metrics
+                    WHERE timestamp < :cutoff
+                """),
+                {"cutoff": cutoff}
+            )
+
+            await session.commit()
+
+        logger.info(f"Cleaned metrics older than {days_to_keep} days")
+
+        clock_manager.create_event({"type": "metrics_cleaned"})

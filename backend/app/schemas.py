@@ -33,6 +33,7 @@ class SessionCreate(BaseModel):
     destination_node: Optional[str] = None
     qos_profile: Optional[Dict[str, Any]] = None
     latency_threshold_ms: int = Field(100, ge=50, le=500)
+    source_node: Optional[str] = None
 
 
 class SessionUpdate(BaseModel):

@@ -115,16 +115,21 @@ class ConsensusService:
                 return
 
             logger.info(f"Election for term {self.current_term}")
-            votes = 1
-            total = len(settings.NODE_URLS)
+            votes = 1  # self-vote
+            core_nodes = [nid for nid in settings.NODE_URLS if "core" in nid]
+            total = len(core_nodes)
 
             async with NetworkClient() as client:
-                tasks = [self._request_vote(nid, client) for nid in settings.NODE_URLS if nid != settings.NODE_ID]
+                tasks = [self._request_vote(nid, client) for nid in core_nodes if nid != settings.NODE_ID]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
                 for res in results:
-                    if not isinstance(res, Exception) and res and res.get("vote_granted"):
+                    # Robust check: only count real True votes
+                    if isinstance(res, dict) and res.get("vote_granted") is True:
                         votes += 1
+                    # else: log skipped (None, exception, False, missing key)
+
+            logger.debug(f"Received {votes} votes out of {total} possible (needed > {total/2})")
 
             if votes > total / 2:
                 logger.info(f"Won election term {self.current_term} with {votes}/{total} votes")
@@ -134,14 +139,15 @@ class ConsensusService:
                 await self._announce_leadership()
                 clock_manager.create_event({"type": "election_won", "term": self.current_term})
             else:
-                logger.info(f"Lost election term {self.current_term}")
+                logger.info(f"Lost election term {self.current_term} with {votes}/{total} votes")
                 self.role = NodeRole.FOLLOWER
                 await self._save_state(db)
                 clock_manager.create_event({"type": "election_lost", "term": self.current_term})
 
     async def _leader_loop(self, db: AsyncSession):
         async with NetworkClient() as client:
-            tasks = [self._send_heartbeat(nid, client) for nid in settings.NODE_URLS if nid != settings.NODE_ID]
+            core_nodes = [nid for nid in settings.NODE_URLS if "core" in nid]
+            tasks = [self._send_heartbeat(nid, client) for nid in core_nodes if nid != settings.NODE_ID]
             await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.sleep(self.heartbeat_interval)
 
@@ -149,7 +155,7 @@ class ConsensusService:
         try:
             return await client.call_node(
                 node_id,
-                "/consensus/vote",
+                "/core/consensus/vote",  # ← FIXED: added /core prefix
                 data={"term": self.current_term, "candidate_id": settings.NODE_ID}
             )
         except Exception as e:
@@ -160,7 +166,7 @@ class ConsensusService:
         try:
             await client.call_node(
                 node_id,
-                "/consensus/heartbeat",
+                "/core/consensus/heartbeat",  # ← FIXED
                 data={"term": self.current_term, "leader_id": settings.NODE_ID}
             )
         except Exception as e:
@@ -171,7 +177,7 @@ class ConsensusService:
             tasks = [
                 client.call_node(
                     nid,
-                    "/consensus/leader",
+                    "/core/consensus/leader",  # ← FIXED
                     data={"term": self.current_term, "leader_id": settings.NODE_ID}
                 )
                 for nid in settings.NODE_URLS if nid != settings.NODE_ID
