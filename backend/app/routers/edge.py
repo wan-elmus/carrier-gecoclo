@@ -106,7 +106,7 @@ async def start_session(
 
         db_session = await TelecomService.setup_session(session, db)
 
-        asyncio.create_task(TelecomService.monitor_session_qos(db_session.session_id, db))
+        # asyncio.create_task(TelecomService.monitor_session_qos(db_session.session_id, db))
 
         logger.info(f"Session {db_session.session_id} started successfully for {session.subscriber_id}")
         return db_session

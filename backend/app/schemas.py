@@ -73,7 +73,7 @@ class TransactionParticipant(BaseModel):
 
 class TransactionRequest(BaseModel):
     transaction_type: Literal["SESSION_SETUP", "HANDOVER", "BILLING_UPDATE", "MIGRATION"]
-    participants: List[str]
+    participants: List[TransactionParticipant]
     operation_data: Dict[str, Any]
     timeout_ms: Optional[int] = 10000
 

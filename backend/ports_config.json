@@ -1,0 +1,86 @@
+{
+  "nodes": {
+    "edge_1": {
+      "type": "edge",
+      "region": "europe",
+      "url": "http://localhost:8082",
+      "port": 8082,
+      "schema": "edge_schema",
+      "replica_of": "core_1"
+    },
+    "edge_2": {
+      "type": "edge",
+      "region": "asia",
+      "url": "http://localhost:8083",
+      "port": 8083,
+      "schema": "edge_schema",
+      "replica_of": "core_1"
+    },
+    "edge_3": {
+      "type": "edge",
+      "region": "americas",
+      "url": "http://localhost:8084",
+      "port": 8084,
+      "schema": "edge_schema",
+      "replica_of": "core_2"
+    },
+    "edge_4": {
+      "type": "edge",
+      "region": "africa",
+      "url": "http://localhost:8086",
+      "port": 8086,
+      "schema": "edge_schema",
+      "replica_of": "core_2"
+    },
+    "core_1": {
+      "type": "core",
+      "role": "primary_coordinator",
+      "url": "http://localhost:8087",
+      "port": 8087,
+      "schema": "core_schema",
+      "backup": "core_2"
+    },
+    "core_2": {
+      "type": "core",
+      "role": "backup_coordinator",
+      "url": "http://localhost:8089",
+      "port": 8089,
+      "schema": "core_schema",
+      "backup": "core_1"
+    },
+    "cloud_1": {
+      "type": "cloud",
+      "role": "primary_storage",
+      "url": "http://localhost:8091",
+      "port": 8091,
+      "schema": "cloud_schema"
+    },
+    "cloud_2": {
+      "type": "cloud",
+      "role": "analytics",
+      "url": "http://localhost:8092",
+      "port": 8092,
+      "schema": "cloud_schema"
+    }
+  },
+  "services": {
+    "monitoring": {
+      "url": "http://localhost:8093",
+      "port": 8093,
+      "type": "monitoring",
+      "schema": "monitoring_schema"
+    },
+    "gateway": {
+      "url": "http://localhost:8094",
+      "port": 8094,
+      "type": "gateway",
+      "schema": "shared_schema"
+    }
+  },
+  "network": {
+    "default_latency_ms": 50,
+    "default_bandwidth_mbps": 1000,
+    "heartbeat_interval_ms": 2000,
+    "timeout_ms": 5000
+  }
+}

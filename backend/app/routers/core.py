@@ -1,4 +1,3 @@
-# app/routers/core.py (corrected - added missing /consensus/heartbeat endpoint)
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -6,12 +5,13 @@ from typing import Dict
 import uuid
 import asyncio
 from datetime import datetime
+from fastapi.responses import JSONResponse
 
 from app.database import get_db
 from app.models import DistributedTransaction, LoadDecision, FaultLog
 from app.schemas import (
     TransactionRequest, TransactionResponse, TransactionPrepareResponse,
-    LoadBalanceRequest, LoadDecisionResponse, MessageResponse
+    LoadBalanceRequest, LoadDecisionResponse, MessageResponse, TransactionParticipant
 )
 from app.config import settings
 from app.utils.logger import setup_logger
@@ -25,7 +25,7 @@ from app.services.load import LoadBalancer
 router = APIRouter()
 logger = setup_logger(__name__)
 
-clock_manager = get_clock_manager()  # Assume initialized in startup
+clock_manager = get_clock_manager()
 
 @router.post("/transaction/begin", response_model=TransactionResponse, status_code=status.HTTP_201_CREATED)
 async def begin_transaction(
@@ -33,15 +33,23 @@ async def begin_transaction(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
-    """Begin a distributed transaction (2PC coordinator)"""
     try:
         xid = f"tx_{uuid.uuid4().hex[:8]}"
+
+        participants_list = []
+        for p in transaction.participants:
+            participants_list.append({
+                "node_id": p.node_id,
+                "url": p.url,
+                "vote": "UNKNOWN",
+                "decided": None
+            })
 
         db_transaction = DistributedTransaction(
             xid=xid,
             coordinator_node=settings.NODE_ID,
             status="INIT",
-            participants=transaction.participants,
+            participants=participants_list,
             transaction_type=transaction.transaction_type,
             timeout_ms=transaction.timeout_ms
         )
@@ -49,7 +57,7 @@ async def begin_transaction(
         await db.commit()
         await db.refresh(db_transaction)
 
-        logger.info(f"Started tx {xid} with {len(transaction.participants)} participants")
+        logger.info(f"Started tx {xid} with {len(participants_list)} participants")
 
         background_tasks.add_task(
             TwoPhaseCommit.coordinate_transaction,
@@ -60,12 +68,24 @@ async def begin_transaction(
 
         clock_manager.create_event({"type": "tx_begun", "xid": xid})
 
-        return TransactionResponse.model_validate(db_transaction)
+        response_data = {
+            "xid": db_transaction.xid,
+            "coordinator_node": db_transaction.coordinator_node,
+            "status": db_transaction.status,
+            "participants": [
+                TransactionParticipant(**p) for p in db_transaction.participants
+            ],
+            "transaction_type": db_transaction.transaction_type,
+            "created_at": db_transaction.created_at
+        }
+
+        return TransactionResponse(**response_data)
+
     except HTTPException:
         raise
     except Exception as e:
         await db.rollback()
-        logger.error(f"Failed to begin tx: {e}")
+        logger.error(f"Failed to begin tx: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to begin tx: {str(e)}"
@@ -76,7 +96,6 @@ async def prepare_transaction(
     xid: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Participant endpoint: Prepare for transaction (2PC phase 1)"""
     try:
         async with DistributedLock("transaction", xid) as lock:
             if not await lock.acquire(timeout_ms=3000):
@@ -106,14 +125,11 @@ async def commit_transaction(
     xid: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Participant endpoint: Commit transaction (2PC phase 2)"""
     try:
         success = await TwoPhaseCommit.commit_local(xid, db)
         if success:
             logger.info(f"Node {settings.NODE_ID} committed tx {xid}")
-
             clock_manager.create_event({"type": "tx_commit", "xid": xid})
-
             return MessageResponse(message=f"Tx {xid} committed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -133,14 +149,11 @@ async def abort_transaction(
     xid: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Participant endpoint: Abort transaction (2PC phase 2)"""
     try:
         success = await TwoPhaseCommit.abort_local(xid, db)
         if success:
             logger.info(f"Node {settings.NODE_ID} aborted tx {xid}")
-
             clock_manager.create_event({"type": "tx_abort", "xid": xid})
-
             return MessageResponse(message=f"Tx {xid} aborted")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -160,7 +173,6 @@ async def get_transaction_status(
     xid: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get transaction status (coordinator endpoint)"""
     try:
         result = await db.execute(
             select(DistributedTransaction).where(DistributedTransaction.xid == xid)
@@ -187,7 +199,6 @@ async def balance_load(
     balance_request: LoadBalanceRequest,
     db: AsyncSession = Depends(get_db)
 ):
-    """Make load balancing decision (migrate session between nodes)"""
     try:
         db_metrics = await LoadBalancer.get_all_node_metrics(db)
 
@@ -228,9 +239,11 @@ async def balance_load(
 
         logger.info(f"Made {len(recorded_decisions)} load decisions")
 
-        if recorded_decisions:
-            return LoadDecisionResponse.model_validate(recorded_decisions[0])
-        return LoadDecisionResponse(message="No migrations needed")
+        if not recorded_decisions:
+            return JSONResponse(
+                status_code=200,
+                content={"message": "No migrations needed - all nodes under threshold"}
+            )
     except HTTPException:
         raise
     except Exception as e:
@@ -246,7 +259,6 @@ async def vote_consensus(
     vote_request: Dict,
     db: AsyncSession = Depends(get_db)
 ):
-    """Participate in consensus voting (leader election, configuration changes)"""
     try:
         term = vote_request.get("term")
         candidate = vote_request.get("candidate_id")
@@ -284,7 +296,6 @@ async def receive_heartbeat(
     heartbeat: Dict,
     db: AsyncSession = Depends(get_db)
 ):
-    """Receive heartbeat from leader and update local state"""
     try:
         term = heartbeat.get("term")
         leader_id = heartbeat.get("leader_id")
@@ -294,13 +305,11 @@ async def receive_heartbeat(
                 detail="Missing term or leader_id"
             )
 
-        # Validate term is >= current
         from app.services.consensus import get_consensus_service
         service = get_consensus_service()
         if term < service.current_term:
             return {"term": service.current_term, "success": False, "reason": "Stale term"}
 
-        # Update last heartbeat and leader
         service.last_heartbeat = datetime.utcnow()
         service.leader_id = leader_id
         service.current_term = max(service.current_term, term)
@@ -330,7 +339,6 @@ async def announce_leader(
     announcement: Dict,
     db: AsyncSession = Depends(get_db)
 ):
-    """Receive leader announcement"""
     try:
         leader_id = announcement.get("leader_id")
         term = announcement.get("term")
@@ -365,7 +373,6 @@ async def announce_leader(
 
 @router.get("/system/overview", response_model=Dict)
 async def get_system_overview(db: AsyncSession = Depends(get_db)):
-    """Get system-wide overview (node status, load distribution, etc.)"""
     try:
         node_metrics = await LoadBalancer.get_all_node_metrics(db)
 

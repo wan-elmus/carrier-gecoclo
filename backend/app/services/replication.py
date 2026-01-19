@@ -13,14 +13,11 @@ from app.utils.locks import DistributedLock
 from app.database import SCHEMAS, set_session_schema
 
 logger = setup_logger(__name__)
-clock_manager = get_clock_manager()  # Assume initialized in startup
+clock_manager = get_clock_manager()
 
 class ReplicationService:
-    """Data replication between schemas/nodes"""
-
     @staticmethod
     async def replicate_subscriber(subscriber_data: Dict, db: AsyncSession) -> bool:
-        """Replicate subscriber data to cloud schema (called from edge create_subscriber or core tx)"""
         try:
             async with DistributedLock("replicate_sub", subscriber_data["subscriber_id"]) as lock:
                 if not await lock.acquire(timeout_ms=3000):
@@ -64,7 +61,6 @@ class ReplicationService:
 
     @staticmethod
     async def replicate_session(session_data: Dict, db: AsyncSession) -> bool:
-        """Replicate session data to cloud schema (called from edge setup_session or core tx)"""
         try:
             async with DistributedLock("replicate_sess", session_data["session_id"]) as lock:
                 if not await lock.acquire(timeout_ms=3000):
@@ -114,7 +110,6 @@ class ReplicationService:
 
     @staticmethod
     async def replicate_transaction_log(log_data: Dict, db: AsyncSession) -> bool:
-        """Replicate transaction log to cloud schema (called from core commit/abort)"""
         try:
             async with DistributedLock("replicate_log", log_data["transaction_id"]) as lock:
                 if not await lock.acquire(timeout_ms=3000):
@@ -129,7 +124,7 @@ class ReplicationService:
                 existing = result.scalar_one_or_none()
 
                 if existing and existing.committed == log_data.get("committed"):
-                    return True  # Already replicated and consistent
+                    return True
 
                 log = TransactionLog(**log_data)
                 db.add(log)
@@ -146,8 +141,8 @@ class ReplicationService:
             return False
 
     @staticmethod
-    async def replicate_session_update(session_id: str, new_node: str, db: AsyncSession):
-        """Replicate session update to other nodes (called from edge handover_session)"""
+    async def replicate_session_update(session_id: str, new_node: str, db: AsyncSession) -> bool:
+        """Replicate session update to other nodes (fixed: now accepts db)"""
         try:
             async with NetworkClient() as client:
                 target_nodes = [nid for nid in settings.NODE_URLS if nid.startswith("edge_") or nid.startswith("core_")]
@@ -178,8 +173,7 @@ class ReplicationService:
             return False
 
     @staticmethod
-    async def replicate_session_termination(session_id: str, db: AsyncSession):
-        """Replicate session termination to other nodes (called from edge terminate_session)"""
+    async def replicate_session_termination(session_id: str, db: AsyncSession) -> bool:
         try:
             async with NetworkClient() as client:
                 target_nodes = [nid for nid in settings.NODE_URLS if nid.startswith("edge_") or nid.startswith("core_")]
@@ -211,7 +205,6 @@ class ReplicationService:
 
     @staticmethod
     async def sync_schemas(source_schema: str, target_schema: str, table_name: str, db: AsyncSession) -> Dict:
-        """Synchronize data between schemas for a specific table (called from cloud /metrics/aggregate or full_replication)"""
         try:
             await set_session_schema(db, target_schema)
             max_id_result = await db.execute(text(f"SELECT COALESCE(MAX(log_id), 0) FROM {table_name}"))
@@ -235,7 +228,7 @@ class ReplicationService:
                         columns = record._fields
                         values = dict(record._mapping)
                         insert_stmt = insert(table_name).values(values).on_conflict_do_update(
-                            index_elements=['log_id'],  # Assume log_id PK
+                            index_elements=['log_id'],
                             set_=values
                         )
                         await db.execute(insert_stmt)
@@ -260,7 +253,6 @@ class ReplicationService:
 
     @staticmethod
     async def perform_full_replication(db: AsyncSession):
-        """Perform full replication of all tables to cloud (called from cloud /backup/create or core /load/balance post-mig)"""
         try:
             report = {"start_time": datetime.utcnow().isoformat(), "tables_replicated": [], "total_records": 0, "errors": 0}
 

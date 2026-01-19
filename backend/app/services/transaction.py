@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from app.database import get_db
 from app.models import DistributedTransaction, TransactionLog, DbSession
-# from app.schemas import TransactionParticipant
 from app.config import settings
 from app.utils.logger import setup_logger
 from app.utils.network import NetworkClient
@@ -17,7 +16,7 @@ from app.utils.locks import DistributedLock, TransactionLocks
 from app.utils.clocks import get_clock_manager
 
 logger = setup_logger(__name__)
-clock_manager = get_clock_manager()  # Assume initialized in startup
+clock_manager = get_clock_manager()
 
 class TransactionStatus(Enum):
     INIT = "INIT"
@@ -29,15 +28,12 @@ class TransactionStatus(Enum):
     ABORTED = "ABORTED"
 
 class TwoPhaseCommit:
-    """Two-Phase Commit protocol implementation"""
-
     @staticmethod
     async def coordinate_transaction(
         xid: str,
         operation_data: Dict[str, Any],
         db: AsyncSession
     ) -> bool:
-        """Coordinate a distributed transaction as coordinator (called from core /transaction/begin background)"""
         try:
             logger.info(f"Starting 2PC for tx {xid}")
 
@@ -59,7 +55,6 @@ class TwoPhaseCommit:
 
     @staticmethod
     async def _prepare_phase(xid: str, operation_data: Dict, db: AsyncSession) -> bool:
-        """Execute Phase 1: Prepare"""
         async with DistributedLock("tx_prepare", xid) as lock:
             if not await lock.acquire(timeout_ms=3000):
                 raise ValueError(f"Tx {xid} prepare locked")
@@ -113,7 +108,6 @@ class TwoPhaseCommit:
 
     @staticmethod
     async def _commit_phase(xid: str, db: AsyncSession) -> bool:
-        """Execute Phase 2: Commit"""
         async with DistributedLock("tx_commit", xid) as lock:
             if not await lock.acquire(timeout_ms=3000):
                 raise ValueError(f"Tx {xid} commit locked")
@@ -170,7 +164,6 @@ class TwoPhaseCommit:
 
     @staticmethod
     async def _abort_transaction(xid: str, db: AsyncSession):
-        """Abort a transaction"""
         try:
             result = await db.execute(
                 select(DistributedTransaction).where(DistributedTransaction.xid == xid)
@@ -200,27 +193,21 @@ class TwoPhaseCommit:
 
     @staticmethod
     async def _request_prepare(node_id: str, url: str, xid: str, operation_data: Dict) -> Optional[Dict]:
-        """Request participant prepare"""
         async with NetworkClient() as client:
             return await client.call_node(node_id, f"/transaction/{xid}/prepare", data={"xid": xid, "operation_data": operation_data})
 
     @staticmethod
     async def _request_commit(node_id: str, url: str, xid: str) -> Optional[Dict]:
-        """Request participant commit"""
         async with NetworkClient() as client:
             return await client.call_node(node_id, f"/transaction/{xid}/commit", data={"xid": xid})
 
     @staticmethod
     async def _request_abort(node_id: str, url: str, xid: str) -> Optional[Dict]:
-        """Request participant abort"""
         async with NetworkClient() as client:
             return await client.call_node(node_id, f"/transaction/{xid}/abort", data={"xid": xid})
 
-    # Participant-side methods
-
     @staticmethod
     async def prepare_local(xid: str, transaction_info: Dict, db: AsyncSession) -> str:
-        """Participant: Prepare local transaction"""
         async with TransactionLocks.lock_resources(db, xid, transaction_info.get("resources", {})):
             operation_data = transaction_info.get("operation_data")
             log = TransactionLog(
@@ -233,7 +220,7 @@ class TwoPhaseCommit:
             db.add(log)
             await db.commit()
 
-            vote = "PREPARE_OK" if random.random() > 0.1 else "PREPARE_FAIL"  # Simulate 10% failure
+            vote = "PREPARE_OK" if random.random() > 0.1 else "PREPARE_FAIL"
 
             clock_manager.create_event({"type": "local_prepare", "xid": xid, "vote": vote})
 
@@ -241,7 +228,6 @@ class TwoPhaseCommit:
 
     @staticmethod
     async def commit_local(xid: str, db: AsyncSession) -> bool:
-        """Participant: Commit local transaction"""
         try:
             result = await db.execute(
                 select(TransactionLog)
@@ -252,7 +238,6 @@ class TwoPhaseCommit:
             if not log:
                 raise ValueError(f"No prepare log for {xid}")
 
-            # Apply changes (example: update session status if applicable)
             if log.operation_type == "SESSION_UPDATE":
                 await db.execute(
                     update(DbSession)
@@ -272,7 +257,6 @@ class TwoPhaseCommit:
 
     @staticmethod
     async def abort_local(xid: str, db: AsyncSession) -> bool:
-        """Participant: Abort local transaction"""
         try:
             result = await db.execute(
                 select(TransactionLog)
@@ -281,7 +265,6 @@ class TwoPhaseCommit:
             )
             log = result.scalar_one_or_none()
             if log:
-                # Rollback changes (example: revert session status)
                 if log.operation_type == "SESSION_UPDATE":
                     await db.execute(
                         update(DbSession)
@@ -300,7 +283,6 @@ class TwoPhaseCommit:
 
     @staticmethod
     async def recover_incomplete_transactions(db: AsyncSession):
-        """Recover incomplete transactions after node restart (called in startup if needed)"""
         try:
             result = await db.execute(
                 select(TransactionLog)
@@ -314,8 +296,7 @@ class TwoPhaseCommit:
                 if datetime.utcnow() - log.log_timestamp > timedelta(minutes=5):
                     await TwoPhaseCommit.abort_local(log.transaction_id, db)
                 else:
-                    # Query coordinator for decision (simulated - in real: network call)
-                    await TwoPhaseCommit.commit_local(log.transaction_id, db)  # Assume commit for MVP
+                    await TwoPhaseCommit.commit_local(log.transaction_id, db)
 
             clock_manager.create_event({"type": "tx_recovery_run"})
         except Exception as e:

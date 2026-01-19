@@ -196,12 +196,13 @@ class TelecomService:
 
                 clock_manager.create_event({"type": "session_handover", "id": session_id, "target": target_node})
 
-                asyncio.create_task(ReplicationService.replicate_session_update(session_id, target_node))
+                # Fixed: pass db to replication call
+                asyncio.create_task(ReplicationService.replicate_session_update(session_id, target_node, db))
 
                 return True
         except Exception as e:
             await db.rollback()
-            logger.error(f"Failed to handover session: {e}")
+            logger.error(f"Failed to handover session: {e}", exc_info=True)
             return False
 
     @staticmethod
@@ -230,7 +231,7 @@ class TelecomService:
 
             clock_manager.create_event({"type": "session_terminated", "id": session_id})
 
-            asyncio.create_task(ReplicationService.replicate_session_termination(session_id))
+            asyncio.create_task(ReplicationService.replicate_session_termination(session_id, db))
 
             return True
         except Exception as e:
@@ -256,9 +257,8 @@ class TelecomService:
             if not current_node:
                 return 0.0
 
-            return await get_network_latency(
-                settings.NODE_ID, current_node
-            ) or TelecomService._simulate_current_latency()
+            latency = await get_network_latency(settings.NODE_ID, current_node)
+            return latency or TelecomService._simulate_current_latency()
 
         except Exception as e:
             logger.error(f"Failed to calculate latency: {e}")
