@@ -1,0 +1,6 @@
+Node,Layer,Latency_ms,Throughput_Mbps,Packet_Loss_pct,CPU_pct,Memory_GB,Transactions_per_sec,Locks_pct,Failure_Type,Services
+Edge1,Edge,12,500,0.2,45,4.0,120,5,Crash,"RPC Call|Data Replication|Event Ordering"
+Edge2,Edge,15,470,0.5,50,4.5,100,8,Omission,"RPC Call|Migration|Node Failure Recovery"
+Core1,Core,8,1000,0.1,65,8.0,250,12,Byzantine,"Transaction Commit|2PC/3PC"
+Core2,Core,10,950,0.2,58,7.5,230,10,Crash,"Recovery|Load Balancing|Deadlock Detection"
+Cloud1,Cloud,22,1250,0.4,72,16.0,300,15,Omission,"Analytics|RPC Call|Distributed Shared Memory"
